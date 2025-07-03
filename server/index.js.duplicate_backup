@@ -1,0 +1,547 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const session = require('express-session');
+const passport = require('passport');
+const MongoStore = require('connect-mongo');
+const path = require('path');
+
+// Import routes
+const authRoutes = require('./routes/auth');
+const oauthRoutes = require('./routes/oauth');
+const profileRoutes = require('./routes/profile');
+const adminRoutes = require('./routes/admin');
+const commerceRoutes = require('./routes/commerce');
+const analyticsRoutes = require('./routes/analytics');
+const twoFARoutes = require('./routes/2fa');
+
+// Import Passport config
+require('./config/passport');
+
+const app = express();
+
+// --- CORS Configuration ---
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:5000',
+  'http://127.0.0.1:5000'
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin) || origin.startsWith('http://192.168.')) {
+      callback(null, true);
+    } else {
+      console.warn('Blocked CORS request from origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'Accept',
+    'Origin',
+    'X-Auth-Token',
+    'X-XSRF-TOKEN'
+  ],
+  exposedHeaders: ['Content-Length', 'X-Foo', 'X-Bar'],
+  maxAge: 86400 // 24 hours
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Enable pre-flight for all routes
+
+// Trust first proxy (important if behind a proxy like nginx)
+app.set('trust proxy', 1);
+
+// Add CORS headers to all responses
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  next();
+});
+
+// --- WebSocket Setup ---
+const http = require('http');
+const WebSocket = require('ws');
+const jwt = require('jsonwebtoken');
+const server = http.createServer(app);
+
+// WebSocket server configuration
+const wss = new WebSocket.Server({ 
+  server,
+  clientTracking: true,
+  path: '/ws'
+});
+
+// Store connected clients by user ID
+const clients = new Map();
+
+// Helper function to send message to a specific user
+function sendToUser(userId, data) {
+  const userClients = clients.get(userId) || new Set();
+  userClients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(data));
+    }
+  });
+}
+
+// Broadcast to all connected clients (optionally excluding a user)
+function broadcast(data, excludeUserId = null) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && 
+        (!excludeUserId || client.userId !== excludeUserId)) {
+      client.send(JSON.stringify(data));
+    }
+  });
+}
+
+// Set up ping/pong for connection keep-alive
+const PING_INTERVAL = 10000; // 10 seconds
+const CONNECTION_TIMEOUT = 30000; // 30 seconds
+
+// Function to set up heartbeat for a WebSocket connection
+function setupHeartbeat(ws) {
+  ws.isAlive = true;
+  
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+  
+  // Set up ping interval
+  const pingInterval = setInterval(() => {
+    if (ws.isAlive === false) {
+      console.log(`Terminating broken connection for user ${ws.userId || 'unknown'}`);
+      return ws.terminate();
+    }
+    
+    ws.isAlive = false;
+    try {
+      ws.ping(() => {});
+    } catch (err) {
+      console.error('Error sending ping:', err);
+    }
+  }, PING_INTERVAL);
+  
+  // Clean up interval on close
+  ws.on('close', () => {
+    clearInterval(pingInterval);
+  });
+  
+  return pingInterval;
+}
+
+// Handle WebSocket connections
+wss.on('connection', (ws, req) => {
+  console.log('New WebSocket connection');
+  
+  // Parse URL to get query parameters
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const token = url.searchParams.get('token');
+  
+  // Set up heartbeat
+  setupHeartbeat(ws);
+  
+  // Set initial connection timeout
+  const connectionTimeout = setTimeout(() => {
+    if (!ws.userId) {
+      console.log('Connection timeout - no authentication');
+      ws.close(4001, 'Authentication timeout');
+    }
+  }, 5000);
+  
+  // Handle authentication via token
+  if (token) {
+    try {
+      // Verify JWT token
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const userId = decoded.id;
+      
+      // Store user ID on the WebSocket connection
+      ws.userId = userId;
+      
+      // Add to clients map
+      if (!clients.has(userId)) {
+        clients.set(userId, new Set());
+      }
+      clients.get(userId).add(ws);
+      
+      console.log(`User ${userId} connected to WebSocket`);
+      clearTimeout(connectionTimeout);
+      
+      // Send welcome message with user info
+      ws.send(JSON.stringify({
+        type: 'CONNECTED',
+        userId,
+        timestamp: new Date().toISOString(),
+        message: 'Successfully connected to WebSocket server'
+      }));
+      
+      // Notify about new connection (except to the connecting user)
+      broadcast({
+        type: 'USER_CONNECTED',
+        userId,
+        timestamp: new Date().toISOString(),
+        message: `User ${userId} connected`
+      }, userId);
+      
+    } catch (err) {
+      console.error('WebSocket authentication error:', err);
+      ws.close(4000, 'Invalid authentication token');
+      return;
+    }
+  } else {
+    console.log('No authentication token provided');
+    ws.close(4000, 'Authentication required');
+    return;
+  }
+  
+  // Handle messages from client
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message);
+      console.log('Received message from', ws.userId, ':', data);
+      
+      // Handle different message types
+      switch (data.type) {
+        case 'PING':
+          // Respond to ping with pong
+          ws.send(JSON.stringify({ 
+            type: 'PONG', 
+            timestamp: new Date().toISOString() 
+          }));
+          break;
+          
+        case 'BROADCAST':
+          // Broadcast message to all connected clients
+          broadcast({
+            type: 'BROADCAST_MESSAGE',
+            from: ws.userId,
+            message: data.message,
+            timestamp: new Date().toISOString()
+          });
+          break;
+          
+        case 'PRIVATE_MESSAGE':
+          // Send private message to specific user
+          if (data.to && data.message) {
+            sendToUser(data.to, {
+              type: 'PRIVATE_MESSAGE',
+              from: ws.userId,
+              message: data.message,
+              timestamp: new Date().toISOString()
+            });
+            
+            // Send delivery confirmation
+            ws.send(JSON.stringify({
+              type: 'MESSAGE_DELIVERED',
+              to: data.to,
+              messageId: data.messageId,
+              timestamp: new Date().toISOString()
+            }));
+          }
+          break;
+          
+        case 'TEST':
+          // Echo test message back to sender
+          ws.send(JSON.stringify({
+            type: 'TEST_RESPONSE',
+            originalMessage: data,
+            serverTime: new Date().toISOString()
+          }));
+          break;
+          
+        default:
+          console.log('Unknown message type:', data.type);
+          ws.send(JSON.stringify({
+            type: 'ERROR',
+            error: 'Unknown message type',
+            receivedType: data.type,
+            timestamp: new Date().toISOString()
+          }));
+      }
+      
+    } catch (err) {
+      console.error('Error processing WebSocket message:', err);
+      ws.send(JSON.stringify({
+        type: 'ERROR',
+        error: 'Invalid message format',
+        timestamp: new Date().toISOString()
+      }));
+    }
+  });
+  
+  // Handle client disconnection
+  ws.on('close', () => {
+    const userId = ws.userId;
+    console.log(`Client disconnected: ${userId || 'unknown'}`);
+    
+    // Remove from clients map
+    if (userId && clients.has(userId)) {
+      const userClients = clients.get(userId);
+      userClients.delete(ws);
+      
+      // Remove user entry if no more connections
+      if (userClients.size === 0) {
+        clients.delete(userId);
+        
+        // Notify other users about disconnection
+        broadcast({
+          type: 'USER_DISCONNECTED',
+          userId,
+          timestamp: new Date().toISOString(),
+          message: `User ${userId} disconnected`
+        });
+      }
+    }
+    
+    clearTimeout(connectionTimeout);
+  });
+  
+  // Handle errors
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+// Clean up dead connections periodically
+setInterval(() => {
+  const now = Date.now();
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive && ws.readyState === WebSocket.OPEN) {
+      console.log('Terminating dead connection');
+      ws.terminate();
+    }
+  });
+}, 30000);
+
+// Expose WebSocket functions to the app
+app.set('broadcastEvent', broadcast);
+app.set('sendToUser', sendToUser);
+
+// Log WebSocket server status
+wss.on('listening', () => {
+  console.log(`WebSocket server is running on ws://localhost:${process.env.PORT || 5000}/ws`);
+});
+
+wss.on('error', (error) => {
+  console.error('WebSocket server error:', error);
+});
+
+// Clean up on server shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down WebSocket server...');
+  wss.close(() => {
+    console.log('WebSocket server closed');
+    process.exit(0);
+  });
+});
+
+// Trust first proxy (important if behind a proxy like nginx)
+app.set('trust proxy', 1);
+
+// CORS configuration
+const corsOptions = {
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5173',
+    'https://your-production-domain.com'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+};
+app.use(cors(corsOptions));
+
+// Session configuration
+const sessionConfig = {
+  secret: process.env.SESSION_SECRET || 'your-secret-key',
+  resave: false,
+  saveUninitialized: false,
+  store: MongoStore.create({
+    mongoUrl: process.env.MONGO_URI,
+    collectionName: 'sessions',
+    ttl: 24 * 60 * 60 // 1 day
+  }),
+  cookie: {
+    maxAge: 24 * 60 * 60 * 1000, // 1 day
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    domain: process.env.NODE_ENV === 'production' ? 'your-production-domain.com' : 'localhost'
+  }
+};
+
+if (process.env.NODE_ENV === 'production') {
+  sessionConfig.cookie.secure = true; // Serve secure cookies
+}
+
+app.use(express.json());
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+// Rate limiting
+// For development, disable trust proxy
+// In production, you should configure this based on your proxy setup
+// For example: app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
+app.set('trust proxy', false);
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again after 15 minutes',
+  // Disable trust proxy for rate limiting
+  // In production, you might want to enable this if behind a proxy
+  trustProxy: false,
+  // Use a custom key generator that doesn't depend on trust proxy
+  keyGenerator: (req, _) => {
+    return req.ip; // Use IP address directly without considering X-Forwarded-For
+  }
+});
+
+app.use(limiter);
+
+// Initialize session and Passport after rate limiting
+app.use(session(sessionConfig));
+app.use(passport.initialize());
+app.use(passport.session());
+
+// Security middleware - development mode
+if (process.env.NODE_ENV === 'development') {
+  console.log('Running in development mode - disabling security restrictions');
+  
+  // Disable HTTPS redirects and strict security in development
+  app.use((req, res, next) => {
+    console.log(`Request: ${req.method} ${req.url}`);
+    next();
+  });
+  
+  // Configure CORS for development
+  app.use(cors({
+    origin: true, // Allow all origins in development
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+  }));
+  
+  // Disable HSTS in development
+  app.use(helmet({
+    hsts: false,
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: false
+  }));
+  
+  // Trust proxy for development
+  app.enable('trust proxy');
+  app.set('trust proxy', 'loopback');
+  
+  // Skip HTTPS redirects in development
+  app.use((req, res, next) => {
+    // Skip HTTPS redirect for all requests in development
+    next();
+  });
+} else {
+  // Production security settings
+  app.use(helmet());
+  app.enable('trust proxy');
+  
+  // Redirect HTTP to HTTPS in production
+  app.use((req, res, next) => {
+    if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+      return next();
+    }
+    res.redirect(`https://${req.headers.host}${req.url}`);
+  });
+}
+
+// PCI/OWASP headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(self), microphone=()');
+  next();
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.status(200).json({
+    message: 'Welcome to the API Server',
+    status: 'running',
+    timestamp: new Date().toISOString(),
+    documentation: 'https://github.com/yourusername/your-repo#api-documentation',
+    endpoints: {
+      health: '/api/health',
+      auth: '/api/auth',
+      oauth: '/api/oauth',
+      websocket: 'ws://localhost:5000/ws'
+    }
+  });
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// API Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/oauth', oauthRoutes);
+app.use('/api/profile', profileRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/commerce', commerceRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/2fa', twoFARoutes);
+
+// Serve static files from the React app in production
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, '../client/dist')));
+  
+  // Handle React routing, return all requests to React app
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../client/dist/index.html'));
+  });
+}
+
+const PORT = process.env.PORT || 5000;
+
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => {
+    // Listen on all network interfaces (IPv4 and IPv6)
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running (HTTP+WebSocket) on port ${PORT}`);
+      console.log(`Listening on all network interfaces (0.0.0.0:${PORT} and [::]:${PORT})`);
+    });
+    
+    // Handle server errors
+    server.on('error', (error) => {
+      console.error('Server error:', error);
+      if (error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use`);
+      }
+    });
+  })
+  .catch((err) => console.error('MongoDB connection error:', err));

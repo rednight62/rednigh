@@ -1,0 +1,135 @@
+version: '3.8'
+
+services:
+  # Backend service
+  backend:
+    build:
+      context: ./backend
+    container_name: platform-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      cockroachdb:
+        condition: service_healthy
+    networks:
+      - platform-network
+    volumes:
+      - ./server/package.json:/usr/src/app/package.json
+      - ./server/package-lock.json:/usr/src/app/package-lock.json
+      - ./server/index.js:/usr/src/app/index.js
+      - ./server/healthcheck.js:/usr/src/app/healthcheck.js
+      - ./server/routes:/usr/src/app/routes
+      - ./server/models:/usr/src/app/models
+      - ./server/middleware:/usr/src/app/middleware
+      - ./server/config:/usr/src/app/config
+      - backend-node-modules:/usr/src/app/node_modules
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Frontend service
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      target: development
+    container_name: platform-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost:5000/api
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - platform-network
+    volumes:
+      - ./client:/usr/src/app
+      - /usr/src/app/node_modules
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:5173"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # MongoDB service
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo 'db.runCommand({ ping: 1 }).ok' | mongo admin -u admin -p securepassword --quiet"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # CockroachDB service
+  cockroachdb:
+    image: cockroachdb/cockroach:latest
+    container_name: cockroachdb
+    command: start-single-node --insecure
+    restart: unless-stopped
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD-SHELL", "cockroach sql --insecure --execute='SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MongoDB Express (Optional, for database management)
+  mongo-express:
+    image: mongo-express
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_USER}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_PASSWORD}
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USER}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD}
+    env_file:
+      - .env.docker
+    depends_on:
+      - mongodb
+    networks:
+      - platform-network
+
+networks:
+  platform-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+
+volumes:
+  mongo-data:
+  cockroach-data:
+  backend-node-modules:
+    driver: local

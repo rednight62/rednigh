@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #output { margin-top: 20px; padding: 10px; border: 1px solid #ccc; min-height: 100px; }
+        button { padding: 8px 16px; margin-right: 10px; }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Connection Test</h1>
+    <div>
+        <button id="connectBtn">Connect</button>
+        <button id="disconnectBtn" disabled>Disconnect</button>
+        <button id="sendBtn" disabled>Send Test Message</button>
+    </div>
+    <div id="output">Status: Disconnected</div>
+
+    <script>
+        let socket;
+        const output = document.getElementById('output');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const sendBtn = document.getElementById('sendBtn');
+        const token = localStorage.getItem('token');
+
+        function log(message) {
+            const timestamp = new Date().toISOString();
+            output.innerHTML += `[${timestamp}] ${message}\n`;
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function connect() {
+            if (!token) {
+                log('Error: No authentication token found. Please log in first.');
+                return;
+            }
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.hostname}:5000/ws?token=${encodeURIComponent(token)}`;
+            
+            log(`Connecting to ${wsUrl}...`);
+            socket = new WebSocket(wsUrl);
+
+            socket.onopen = () => {
+                log('Connected to WebSocket server');
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+                sendBtn.disabled = false;
+            };
+
+            socket.onmessage = (event) => {
+                log(`Received: ${event.data}`);
+            };
+
+            socket.onclose = (event) => {
+                log(`Disconnected: ${event.code} ${event.reason || 'No reason provided'}`);
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                sendBtn.disabled = true;
+            };
+
+            socket.onerror = (error) => {
+                log(`WebSocket error: ${error.message || 'Unknown error'}`);
+            };
+        }
+
+        function disconnect() {
+            if (socket) {
+                log('Disconnecting...');
+                socket.close();
+            }
+        }
+
+        function sendTestMessage() {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                const message = {
+                    type: 'TEST',
+                    content: 'Test message from client',
+                    timestamp: new Date().toISOString()
+                };
+                socket.send(JSON.stringify(message));
+                log(`Sent: ${JSON.stringify(message)}`);
+            } else {
+                log('Error: WebSocket is not connected');
+            }
+        }
+
+
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        sendBtn.addEventListener('click', sendTestMessage);
+    </script>
+</body>
+</html>
